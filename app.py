@@ -8,226 +8,394 @@ from flask import Flask, request, jsonify, render_template
 app = Flask(__name__)
 
 # ------------------------------------------------------------
-# 1. EXECUÇÃO DO ESBMC
+# 1. FUNÇÕES AUXILIARES DE EXECUÇÃO
 # ------------------------------------------------------------
-def executar_esbmc(codigo_usuario: str, flags: list):
+def criar_arquivo_temp(codigo: str):
+    # Prefixo para fácil identificação
+    tmp = tempfile.NamedTemporaryFile(delete=False, prefix="esbmc_codigo_usuario_", suffix=".py")
+    tmp.write(codigo.encode("utf-8"))
+    tmp.close()
+    return tmp.name
+
+def rodar_cmd_esbmc(path_arquivo: str, flags: list, timeout_sec=None):
+    # Passa todas as flags diretamente (ESBMC v7.11+ suporta --strict-types nativamente)
+    cmd = ["esbmc", path_arquivo] + flags
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".py") as tmp:
-            tmp.write(codigo_usuario.encode("utf-8"))
-            tmp_path = tmp.name
-
-        cmd_base = ["esbmc", tmp_path]
-        
-        user_flags = list(flags) if flags else []
-        if not any(f.strip() == "--unwind" for f in user_flags):
-            user_flags.extend(["--unwind", "32"])
-        cmd_base.extend(user_flags)
-
-        # NÍVEL 1: Modo Visual
-        cmd_visual = cmd_base.copy()
-        if "--no-slice" not in cmd_visual: cmd_visual.append("--no-slice")
-
-        try:
-            result = subprocess.run(cmd_visual, capture_output=True, text=True, timeout=15)
-            return result.stdout + result.stderr, " ".join(cmd_visual)
-        except subprocess.TimeoutExpired:
-            # NÍVEL 2: Modo Padrão
-            try:
-                result = subprocess.run(cmd_base, capture_output=True, text=True, timeout=60)
-                return result.stdout + result.stderr, " ".join(cmd_base)
-            except subprocess.TimeoutExpired:
-                # NÍVEL 3: Fallback
-                cmd_fallback = list(cmd_base)
-                if "--multi-property" in cmd_fallback: cmd_fallback.remove("--multi-property")
-                if "--memory-leak-check" in cmd_fallback: cmd_fallback.remove("--memory-leak-check")
-                try:
-                    result = subprocess.run(cmd_fallback, capture_output=True, text=True, timeout=90)
-                    return result.stdout + result.stderr, " ".join(cmd_fallback) + " (Fallback)"
-                except:
-                    return "TIMEOUT CRÍTICO", "Erro"
+        # timeout=None espera o tempo que for necessário
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
+        return result.stdout + result.stderr, " ".join(cmd)
+    except subprocess.TimeoutExpired:
+        return "TIMEOUT CRÍTICO", " ".join(cmd)
     except Exception as e:
         return str(e), "Erro"
 
 # ------------------------------------------------------------
-# 2. PARSE LÓGICO (FILTRO ESTRITO)
+# 2. PARSE LÓGICO (Lista Branca + Deduplicação)
 # ------------------------------------------------------------
-def parse_contraexemplo_detalhado(saida_esbmc: str, codigo_original: str):
-    if "VERIFICATION FAILED" not in saida_esbmc and "VERIFICATION FAILED" not in saida_esbmc.upper():
-        return []
+def parse_contraexemplo_detalhado(saida_esbmc: str, codigo_original: str, arquivo_analisado: str):
+    # Se deu sucesso, não há contraexemplo
+    if "VERIFICATION SUCCESSFUL" in saida_esbmc:
+        return [], {}
 
     passos_brutos = []
     variaveis_memoria = {}
     
-    regex_state = re.compile(r"State \d+ .*? line (\d+)")
+    regex_state = re.compile(r"State \d+ (?:file (.*?) line (\d+)|function (.*?) thread|thread \d+)")
     regex_assign = re.compile(r"^\s*([\w:$.\[\]]+)\s*=\s*(.+)$")
+    regex_violation = re.compile(r"Violated property|ERROR: Exception thrown")
+    regex_clean_var = re.compile(r"^([a-zA-Z_]\w*)(?:\$.+)?$")
 
-    linhas = saida_esbmc.split("\n")
-    
-    # Variáveis temporárias para agrupar estados da MESMA linha
-    linha_atual_processando = -1
-    vars_linha_atual = {}
+    linhas_log = saida_esbmc.split("\n")
+    nome_arquivo_base = os.path.basename(arquivo_analisado)
+    linhas_cod = codigo_original.split("\n")
+    total_linhas = len(linhas_cod)
+
+    # --- 1. ALLOWLIST (Variáveis do Usuário) ---
+    vars_usuario = set()
+    rgx_attr = re.compile(r"^\s*([a-zA-Z_]\w*)(?:\s*:\s*[\w\[\]]*)?\s*=")
+    rgx_def = re.compile(r"def\s+[a-zA-Z_]\w*\s*\(([^)]*)\)")
+    rgx_for = re.compile(r"for\s+([a-zA-Z_]\w*)\s+in")
+
+    for l in linhas_cod:
+        m = rgx_attr.search(l)
+        if m: vars_usuario.add(m.group(1))
+        m_for = rgx_for.search(l)
+        if m_for: vars_usuario.add(m_for.group(1))
+        m_def = rgx_def.search(l)
+        if m_def:
+            args_str = m_def.group(1)
+            args = [a.split(':')[0].strip() for a in args_str.split(',') if a.strip()]
+            for arg in args:
+                if arg and arg != 'self': vars_usuario.add(arg)
+
+    # --- MAPAS ---
+    mapa_vars_linhas = {} 
+    for i, l in enumerate(linhas_cod):
+        m = rgx_attr.search(l)
+        if m: 
+            v = m.group(1)
+            if v not in mapa_vars_linhas: mapa_vars_linhas[v] = i + 1
+        m_for = rgx_for.search(l)
+        if m_for:
+            v = m_for.group(1)
+            if v not in mapa_vars_linhas: mapa_vars_linhas[v] = i + 1
+
+    mapa_args_func = {} 
+    for l in linhas_cod:
+        m = rgx_def.search(l)
+        if m:
+            func = l.split('def')[1].split('(')[0].strip()
+            args_str = m.group(1)
+            args = [a.split(':')[0].strip() for a in args_str.split(',') if a.strip()]
+            for arg in args:
+                if arg and arg != 'self': mapa_args_func[arg] = func
+
+    mapa_chamadas = {} 
+    rgx_call = re.compile(r"\b([a-zA-Z_]\w*)\s*\(")
+    for i, l in enumerate(linhas_cod):
+        if l.strip().startswith("def "): continue
+        matches = rgx_call.finditer(l)
+        for m in matches:
+            f = m.group(1)
+            if f not in mapa_chamadas: mapa_chamadas[f] = []
+            mapa_chamadas[f].append(i + 1)
+
+    indice_chamadas = {f: 0 for f in mapa_chamadas}
+    args_vistos_chamada_atual = {f: set() for f in mapa_chamadas}
+    chamadas_injetadas = set()
+
+    linha_atual = -1
+    exibir_passo = False
     erro_na_linha = False
+    
+    # Controle de múltiplos contraexemplos (Pega apenas o primeiro)
+    contador_contraexemplos = 0 
 
-    def salvar_passo(linha, vars_snapshot, erro):
-        # Só cria o passo se for uma linha válida (>0)
-        total_linhas = len(codigo_original.split("\n"))
-        
-        if 1 <= linha <= total_linhas:
+    def salvar():
+        if 1 <= linha_atual <= total_linhas:
+            # Deduplicação
+            if passos_brutos:
+                prev = passos_brutos[-1]
+                if prev["linha_atual"] == linha_atual and not prev["erro"]:
+                    passos_brutos[-1] = {
+                        "codigo": codigo_original,
+                        "linha_atual": linha_atual,
+                        "variaveis": variaveis_memoria.copy(),
+                        "erro": erro_na_linha
+                    }
+                    return
+
             passos_brutos.append({
                 "codigo": codigo_original,
-                "linha_atual": linha,
-                "variaveis": vars_snapshot.copy(),
-                "erro": erro
+                "linha_atual": linha_atual,
+                "variaveis": variaveis_memoria.copy(),
+                "erro": erro_na_linha
             })
 
-    for ln in linhas:
+    for ln in linhas_log:
         ln = ln.strip()
-        
-        # 1. Detectou Violação? Marca flag.
-        if "Violated property" in ln:
-             erro_na_linha = True
-             continue
 
-        # 2. Novo Estado Detectado
-        match_state = regex_state.search(ln)
-        if match_state:
-            nova_linha = int(match_state.group(1))
-            
-            # Se mudou de linha, salvamos o acumulado da linha ANTERIOR
-            if nova_linha != linha_atual_processando:
-                if linha_atual_processando != -1:
-                    salvar_passo(linha_atual_processando, variaveis_memoria, erro_na_linha)
-                
-                # Reseta controles para a nova linha
-                linha_atual_processando = nova_linha
-                erro_na_linha = False
-            
+        if "[Counterexample]" in ln:
+            contador_contraexemplos += 1
+            if contador_contraexemplos > 1: break
             continue
 
-        # 3. Variáveis
-        # Processa variáveis apenas se estamos dentro de um estado válido
-        if linha_atual_processando != -1 and "=" in ln and "State" not in ln and "thread" not in ln:
-            match_assign = regex_assign.match(ln)
-            if match_assign:
-                var_nome = match_assign.group(1).strip()
-                var_valor_bruto = match_assign.group(2).strip()
+        if regex_violation.search(ln):
+            match_l = re.search(r"line (\d+)", ln)
+            if match_l:
+                nova_linha_erro = int(match_l.group(1))
+                if linha_atual != -1 and linha_atual != nova_linha_erro and exibir_passo:
+                    salvar()
+                linha_atual = nova_linha_erro
+                erro_na_linha = True
+                exibir_passo = True
+            continue
 
-                # --- LISTA NEGRA: Remove variáveis internas e message ---
-                ignorar = [
-                    "__ESBMC", "argv", "return_value", "value", "nondet", 
-                    "pthread", "dynamic_", "rounding_mode", 
-                    "message", "name", "stdin", "stdout", "stderr"
-                ]
-                
-                if any(x == var_nome or var_nome.startswith(x) for x in ignorar):
-                    continue
-                
-                # Limpa valor binário
-                valor = var_valor_bruto.split('(')[0].strip() if "(" in var_valor_bruto else var_valor_bruto
-                
-                # Atualiza a memória global
-                variaveis_memoria[var_nome] = valor
+        match_st = regex_state.search(ln)
+        if match_st:
+            f_name = match_st.group(1)
+            l_num = match_st.group(2)
+            if f_name and l_num:
+                nova_linha = int(l_num)
+                eh_user = (os.path.basename(f_name.strip()) == nome_arquivo_base)
+                if eh_user:
+                    if nova_linha != linha_atual:
+                        if linha_atual != -1 and exibir_passo: salvar()
+                        linha_atual = nova_linha
+                        exibir_passo = True
+                        erro_na_linha = False
+            continue
 
-    # Salva o último passo pendente
-    if linha_atual_processando != -1:
-        salvar_passo(linha_atual_processando, variaveis_memoria, erro_na_linha)
+        if "=" in ln and "State" not in ln:
+            if "==" in ln: continue 
 
-    # --- DEDUPLICAÇÃO FINAL ---
-    # Remove passos onde as variáveis NÃO mudaram em relação ao passo anterior.
-    # Exceção: O primeiro passo e o passo de erro sempre aparecem.
+            m_as = regex_assign.match(ln)
+            if m_as:
+                raw_name = m_as.group(1).strip()
+                valor = m_as.group(2).strip().split('(')[0].strip()
+                valor = valor.lstrip("= ")
+                if valor.replace(" ", "") == "{}": valor = "None"
 
-    return passos_brutos
+                clean_match = regex_clean_var.match(raw_name)
+                nome = clean_match.group(1) if clean_match else raw_name
+
+                if nome not in vars_usuario: continue
+
+                variaveis_memoria[nome] = valor
+                passo_injetado = False
+
+                # Injeção de Chamada
+                if nome in mapa_args_func:
+                    func_dona = mapa_args_func[nome]
+                    if func_dona in mapa_chamadas and func_dona in indice_chamadas:
+                        if nome in args_vistos_chamada_atual[func_dona]:
+                            indice_chamadas[func_dona] += 1
+                            args_vistos_chamada_atual[func_dona] = set()
+                        args_vistos_chamada_atual[func_dona].add(nome)
+                        
+                        idx = indice_chamadas[func_dona]
+                        lista = mapa_chamadas[func_dona]
+                        if idx < len(lista):
+                            l_call = lista[idx]
+                            call_id = (func_dona, idx)
+                            if l_call != linha_atual and call_id not in chamadas_injetadas:
+                                if linha_atual != -1 and exibir_passo: salvar()
+                                linha_atual = l_call
+                                exibir_passo = True
+                                erro_na_linha = False
+                                salvar()
+                                passo_injetado = True
+                                chamadas_injetadas.add(call_id)
+
+                # Inferência
+                if not passo_injetado and nome in mapa_vars_linhas:
+                    l_mapa = mapa_vars_linhas[nome]
+                    deve_inferir = (not exibir_passo) or (l_mapa > linha_atual) or (nome in mapa_args_func)
+                    if deve_inferir and l_mapa != linha_atual:
+                        if linha_atual != -1 and exibir_passo: salvar()
+                        linha_atual = l_mapa
+                        exibir_passo = True
+                        erro_na_linha = False
+
+    if linha_atual != -1 and exibir_passo:
+        salvar()
+
+    return passos_brutos, variaveis_memoria.copy()
 
 # ------------------------------------------------------------
 # 3. GERAR PYTEST
 # ------------------------------------------------------------
-def gerar_pytest(codigo_usuario: str):
+def gerar_pytest(codigo_usuario: str, vars_erro: dict):
     codigo_seguro = codigo_usuario.replace("'''", "\\'\\'\\'")
     return f"""import pytest
 import math
 import random
 
-def mock_nondet_int(): return random.randint(-100, 100)
-def mock_nondet_uint(): return random.randint(0, 100)
-def mock_assume(cond): pass 
+VALORES_FALHA = {json.dumps(vars_erro, indent=4)}
+
+def mock_input(prompt=""): return "0"
+def mock_assume(cond): 
+    if not cond: pytest.skip("Assume ignorado")
 def mock_cover(cond): pass
 
 mock_globals = {{
-    'math': math, 'pytest': pytest, 'random': random,
-    'nondet_int': mock_nondet_int, 'nondet_uint': mock_nondet_uint,
+    'math': math, 'pytest': pytest, 'random': random, 'input': mock_input,
+    'nondet_int': lambda: random.randint(-100,100),
+    'nondet_uint': lambda: random.randint(0,100),
+    'nondet_float': lambda: random.uniform(-100,100),
+    'nondet_bool': lambda: random.choice([True, False]),
     '__ESBMC_assume': mock_assume, '__ESBMC_cover': mock_cover
 }}
 
-def test_cenario_usuario():
-    print("\\n--- Execução Controlada ---")
-    codigo_fonte = '''
-{codigo_seguro}
-'''
+def test_reproducao():
+    print(f"\\nContexto Falha ESBMC: {{VALORES_FALHA}}")
     try:
-        exec(codigo_fonte, mock_globals)
-    except AssertionError as e: pytest.fail(f"Asserção falhou: {{e}}")
+        exec('''{codigo_seguro}''', mock_globals)
+    except AssertionError as e: pytest.fail(f"Asserção: {{e}}")
     except ZeroDivisionError: pytest.fail("Divisão por zero!")
-    except TypeError as e: pytest.fail(f"Erro de Tipo: {{e}}")
-    except IndexError as e: pytest.fail(f"Erro de Índice: {{e}}")
-    except NameError as e: pytest.fail(f"Erro de Nome: {{e}}")
     except Exception as e: pytest.fail(f"Erro: {{type(e).__name__}}: {{e}}")
 """
 
 # ------------------------------------------------------------
-# 4. ENDPOINTS
+# 4. ROTA PRINCIPAL
 # ------------------------------------------------------------
 @app.route("/verificar", methods=["POST"])
 def verificar():
     data = request.get_json()
     codigo = data.get("codigo", "")
-    flags = data.get("flags", [])
+    flags_usuario = data.get("flags", [])
 
-    saida_esbmc, comando_usado = executar_esbmc(codigo, flags)
-    passos_contraexemplo = parse_contraexemplo_detalhado(saida_esbmc, codigo)
+    path_tmp = criar_arquivo_temp(codigo)
     
-    status_texto = "Sucesso: Nenhuma falha encontrada."
-    causa_texto = "Nenhuma falha detectada."
+    # 1. VERIFICAÇÃO PRINCIPAL
+    saida_usuario, cmd_usuario_display = rodar_cmd_esbmc(path_tmp, flags_usuario, timeout_sec=None)
     
-    if "TIMEOUT CRÍTICO" in saida_esbmc:
-        status_texto = "Erro: Timeout Crítico."
-        causa_texto = "Tempo limite excedido."
-    elif "VERIFICATION FAILED" in saida_esbmc or "VERIFICATION FAILED" in saida_esbmc.upper():
-        status_texto = "Falha detectada!"
-        linhas = saida_esbmc.split("\n")
-        causa_texto = "Erro desconhecido"
-        for i, ln in enumerate(linhas):
-            if "Violated property" in ln:
-                if i + 2 < len(linhas):
-                    c = linhas[i+2].strip()
-                    if c and "-----" not in c: causa_texto = c
-                    elif i + 3 < len(linhas): causa_texto = linhas[i+3].strip()
-                break
+    # Análise de Resultados
+    is_success = "VERIFICATION SUCCESSFUL" in saida_usuario
+    has_type_warning = "Type checking warning" in saida_usuario
+    
+    is_failed = "VERIFICATION FAILED" in saida_usuario or "FAILED:" in saida_usuario
+    is_timeout = "TIMEOUT CRÍTICO" in saida_usuario
+    is_cmd_error = "ERROR: unrecognised option" in saida_usuario
+    
+    modo_estrito = "--strict-types" in flags_usuario
 
-    if "Sucesso" not in status_texto:
-        interpretacao_final = f"{status_texto}\nCausa: {causa_texto}"
-    else:
-        interpretacao_final = status_texto
+    passos_contraexemplo = []
+    vars_erro = {}
 
-    pytest_code = gerar_pytest(codigo)
+    # 2. SHADOW RUN
+    should_debug = (not is_success) and not is_timeout and not is_cmd_error
     
-    pytest_result = "Não executado."
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".py") as tmp_test:
-            tmp_test.write(pytest_code.encode("utf-8"))
-            tmp_path_test = tmp_test.name
+    if should_debug:
+        flags_debug = list(flags_usuario)
+        if "--no-slice" not in flags_debug: flags_debug.append("--no-slice")
+        if not any("--unwind" in f for f in flags_debug): flags_debug.extend(["--unwind", "32"])
         
-        res_pytest = subprocess.run(["pytest", tmp_path_test], capture_output=True, text=True, timeout=10)
-        pytest_result = res_pytest.stdout + res_pytest.stderr
-        os.remove(tmp_path_test)
+        saida_debug, _ = rodar_cmd_esbmc(path_tmp, flags_debug, timeout_sec=None)
+        passos_contraexemplo, vars_erro = parse_contraexemplo_detalhado(saida_debug, codigo, path_tmp)
+
+    if os.path.exists(path_tmp): os.remove(path_tmp)
+
+    # 3. STATUS
+    status_label = "Sucesso: Código Seguro"
+    status_class = "font-bold text-xl text-green-600"
+    causa_texto = "Nenhuma falha."
+
+    if is_timeout:
+        status_label = "⚠️ Erro: Timeout"
+        status_class = "font-bold text-xl text-orange-600"
+        causa_texto = "Tempo excedido."
+    elif is_cmd_error:
+        status_label = "⚠️ Erro de Configuração"
+        status_class = "font-bold text-xl text-orange-600"
+        match_err = re.search(r"ERROR: (.*)", saida_usuario)
+        causa_texto = match_err.group(1) if match_err else "Opção inválida detectada."
+    
+    elif is_success:
+        status_label = "✅ Sucesso / Código Seguro"
+        status_class = "font-bold text-xl text-green-600"
+        causa_texto = "Nenhuma falha."
+    
+    else:
+        # Falha Real (crash, assert, ou strict type error nativo)
+        if modo_estrito and has_type_warning:
+            status_label = "❌ Falha Encontrada (Strict Mode)"
+            status_class = "font-bold text-xl text-red-600"
+            match_warn = re.search(r"error: (.*?) \[", saida_usuario)
+            causa_texto = match_warn.group(1) if match_warn else "Type checking warning"
+        
+        elif has_type_warning and not is_failed:
+             # Warning de tipo sem flag strict = Alerta
+             status_label = "⚠️ Alerta de Tipagem"
+             status_class = "font-bold text-xl text-yellow-600"
+             match_warn = re.search(r"error: (.*?) \[", saida_usuario)
+             causa_texto = match_warn.group(1) if match_warn else "Type checking warning"
+        
+        else:
+            status_label = "❌ Falha Encontrada"
+            status_class = "font-bold text-xl text-red-600"
+            causa_texto = "Erro desconhecido"
+            
+            linhas = saida_usuario.split("\n")
+            melhor_causa = ""
+            prioridade_causa = 0
+
+            for i, ln in enumerate(linhas):
+                if "Violated property" in ln:
+                    causa_temp = ""
+                    for j in range(1, 4):
+                        if i+j < len(linhas):
+                            t = linhas[i+j].strip()
+                            if t and "-----" not in t and "file" not in t:
+                                if t == "assertion": continue
+                                t = re.sub(r"\$\w+", "", t)
+                                causa_temp = t
+                                break
+                    if causa_temp:
+                        prio_temp = 1
+                        if any(c in causa_temp for c in ["division by zero", "overflow", "bounds", "NaN"]): prio_temp = 2
+                        if prio_temp > prioridade_causa:
+                            prioridade_causa = prio_temp
+                            melhor_causa = causa_temp
+                            if prio_temp == 2: break 
+
+                elif "Missing return" in ln and prioridade_causa < 2:
+                    melhor_causa = "Missing return statement"
+                    prioridade_causa = 2
+                elif "ERROR: Exception thrown" in ln and prioridade_causa < 2:
+                    melhor_causa = ln
+                    prioridade_causa = 2
+
+            if melhor_causa:
+                if any(op in melhor_causa for op in ["==", "!=", "<", ">", "+", "-", "*", "/"]) and prioridade_causa == 1:
+                    causa_texto = f"assert {melhor_causa}"
+                else:
+                    causa_texto = melhor_causa
+
+    interpretacao_final = f"{status_label}\nCausa: {causa_texto}"
+
+    pytest_code = gerar_pytest(codigo, vars_erro)
+    
+    pytest_result = "N/A"
+    try:
+        t_py = tempfile.NamedTemporaryFile(delete=False, suffix=".py")
+        t_py.write(pytest_code.encode("utf-8"))
+        t_py_path = t_py.name
+        t_py.close()
+        res_py = subprocess.run(["pytest", t_py_path], capture_output=True, text=True, timeout=10)
+        pytest_result = res_py.stdout + res_py.stderr
+        os.remove(t_py_path)
     except Exception as e:
-        pytest_result = f"Erro ao rodar pytest: {str(e)}"
+        pytest_result = str(e)
 
     return jsonify({
-        "comando": comando_usado,
-        "resultado_bruto": saida_esbmc,
+        "comando": cmd_usuario_display,
+        "resultado_bruto": saida_usuario,
         "interpretacao": interpretacao_final,
+        "status_label": status_label,
+        "status_class": status_class,
+        "causa": causa_texto,
         "contraexemplo": passos_contraexemplo,
-        "tempo": "N/A",
         "pytest_code": pytest_code,
         "pytest_result": pytest_result
     })
