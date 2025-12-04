@@ -1,22 +1,18 @@
-🔍 ESBMC-Python Web Checker
+**🔍 ESBMC-Python Web Checker**
 
 Este projeto é uma interface web para verificar a segurança e correção de programas Python utilizando o ESBMC (Efficient SMT-Based Context-Bounded Model Checker).
 
 A ferramenta permite escrever código Python, configurar flags de verificação e visualizar contraexemplos passo a passo, além de gerar automaticamente testes de regressão (pytest) para reproduzir as falhas encontradas.
 
-✨ Funcionalidades
+**✨ Funcionalidades**
 
-Verificação Formal: Detecta divisão por zero, acesso fora dos limites de lista, overflows e vazamentos de memória.
-
-Strict Type Checking: Suporte nativo para detecção de erros de tipagem estática (com a flag --strict-types).
+Verificação Formal: Detecta divisão por zero, acesso fora dos limites de lista, overflows, vazamentos de memória e demais flags de verificação.
 
 Contraexemplo Visual: Debugger interativo que mostra a execução passo a passo até a falha, exibindo valores de variáveis.
 
 Geração de Testes: Cria automaticamente um arquivo pytest com os valores exatos que causaram a falha.
 
-Propriedades Customizadas: Suporte para assert, __ESBMC_assume e __ESBMC_cover (alcançabilidade).
-
-🚀 Pré-requisitos
+**🚀 Pré-requisitos**
 
 Este projeto foi desenvolvido para rodar em ambiente Linux (ou WSL no Windows), pois depende da compilação do ESBMC a partir do código-fonte.
 
@@ -37,9 +33,9 @@ source venv/bin/activate
 pip install flask pytest
 
 
-🛠️ Instalação do ESBMC (Essencial)
+**🛠️ Instalação do ESBMC**
 
-Para utilizar funcionalidades recentes como --strict-types e suporte completo a Python, é necessário compilar o ESBMC a partir da branch main.
+Para utilizar funcionalidades recentes e obter suporte completo a Python, é necessário compilar o ESBMC a partir da branch main.
 
 Crie um script chamado install_esbmc.sh na raiz do projeto:
 
@@ -83,7 +79,7 @@ Inicie o servidor Flask:
 python3 app.py
 
 
-Acesse no navegador: http://localhost:5000
+Acesse no navegador: http://localhost:5000 ou http://127.0.0.1:5000/
 
 📖 Exemplos de Uso
 
@@ -117,22 +113,18 @@ if x > 100:
     __ESBMC_cover(x > 100)
 
 
-🧩 Estrutura do Projeto
+**🧩 Estrutura do Projeto**
 
 app.py: Backend Flask. Gerencia a execução do binário esbmc, faz o parsing dos logs (regex) e gera o código pytest.
 
 templates/index.html: Frontend. Interface para escrita de código e visualização dos contraexemplos.
 
-install_esbmc.sh: Script auxiliar para compilar o verificador.
 
-⚠️ Resolução de Problemas
-
-Erro "No solver backends built": Significa que o ESBMC foi compilado sem Z3. Rode o script de instalação novamente.
-
-Erro "unrecognised option '--strict-types'": Sua versão do ESBMC é antiga. Use o script de instalação para atualizar para a versão Nightly/Main.
+**⚠️ Resolução de Problemas**
 
 Timeout: Para códigos muito complexos ou com loops grandes, aumente o --unwind ou simplifique o código. A interface web aguarda indefinidamente, mas o navegador pode desconectar.
 
-📄 Licença
+
+**📄 Licença**
 
 Este projeto é uma interface para o ESBMC. Consulte a licença do ESBMC para detalhes sobre o uso do verificador.
